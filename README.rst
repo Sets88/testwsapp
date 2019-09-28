@@ -15,7 +15,7 @@ after DB initialization finished, you can run websocket app with::
     ./run_ws.sh
 
 
-and update assets service:
+and run update assets service:
 
     ./run_update.sh
 
