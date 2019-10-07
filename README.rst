@@ -15,8 +15,10 @@ after DB initialization finished, you can run websocket app with::
     ./run_ws.sh
 
 
-and update assets service:
+and run update assets service:
 
     ./run_update.sh
 
 
+To test application you also have to use ./tests/testing_credentials_example.env as an example for ./test/testing_credentials.env
+to test it you have to install pytest_aiohttp
