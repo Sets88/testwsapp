@@ -14,29 +14,64 @@ from aiohttp.web_exceptions import HTTPMethodNotAllowed
 import simplejson as json
 
 
-class WSApp(object):
+class Subscriber():
+    def __init__(self, asset_id):
+        self.asset_id = int(asset_id)
+        self.future = asyncio.Future()
+        self.redis = None
+
+    async def redis_connect(self):
+        redis_host = os.environ.get('REDIS_HOST', 'localhost')
+        self.redis = await asyncio_redis.Connection.create(host=redis_host, port=6379, db=1)
+
+    def next_published(self):
+        if self.future.cancelled():
+            self.future = asyncio.Future()
+        return self.future
+
+    async def run(self):
+        redis_prefix = os.environ.get('REDIS_PREFIX', '')
+        await self.redis_connect()
+        subscriber = await self.redis.start_subscribe()
+        await subscriber.subscribe(['%sasset_data_%s' % (redis_prefix, self.asset_id)])
+        while True:
+            msg = await subscriber.next_published()
+            self.future.set_result(msg)
+            self.future = asyncio.Future()
+
+
+class DataCollector():
+    def __init__(self, db):
+        self.db = db
+        self.assets = dict()
+        self.subscribers = dict()
+
+    async def load_assets(self):
+        async with self.db.acquire() as conn:
+            res = await conn.fetch('SELECT id, symbol as name FROM assets')
+            return [dict(x) for x in res]
+
+    def get_subscriber(self, asset_id):
+        return self.subscribers[asset_id]
+
+    async def run(self):
+        redis_prefix = os.environ.get('REDIS_PREFIX', '')
+        loop = asyncio.get_event_loop()
+        tasks = []
+        for asset in await self.load_assets():
+            subscriber = Subscriber(asset['id'])
+            task = loop.create_task(subscriber.run())
+            self.subscribers[int(asset['id'])] = subscriber
+            tasks.append(task)
+        await asyncio.gather(*tasks)
+
+
+class WSApp():
     def __init__(self, request):
         self.request = request
         self.ws = web.WebSocketResponse()
-        self.redis = None
-        self.db = None
         self.subscriber = None
         self.current_asset = None
-
-    async def redis_connect(self):
-        """!Connecting to redis server"""
-        if self.redis is None:
-            redis_host = os.environ.get('REDIS_HOST', 'localhost')
-            self.redis = await asyncio_redis.Connection.create(host=redis_host, port=6379, db=1)
-
-    async def db_connect(self):
-        """!Connecting to database"""
-        if self.db is None:
-            self.db = await asyncpg.connect(user=os.environ['POSTGRES_DB_USER'],
-                                            password=os.environ['POSTGRES_DB_PASS'],
-                                            database=os.environ['POSTGRES_DB_NAME'],
-                                            host=os.environ['POSTGRES_DB_HOST'],
-                                            port=os.environ['POSTGRES_DB_PORT'])
 
     async def send_error(self, data, error):
         """!Sending error message into websocket
@@ -56,12 +91,7 @@ class WSApp(object):
     async def channel_subscribe(self, asset_id):
         """!Subscribing to asset redis channel
         @param asset_id id of asset to subscribe to"""
-        redis_prefix = os.environ.get('REDIS_PREFIX', '')
-        if self.subscriber is None:
-            self.subscriber = await self.redis.start_subscribe()
-        else:
-            await self.subscriber.unsubscribe(['%sasset_data_%s' % (redis_prefix, self.current_asset['id'])])
-        await self.subscriber.subscribe(['%sasset_data_%s' % (redis_prefix, asset_id)])
+        self.subscriber = self.request.app['data'].get_subscriber(asset_id)
 
     async def check_input_subscribe(self, data):
         """!Checking input data of subscribe action received from websocket
@@ -77,35 +107,38 @@ class WSApp(object):
         @param asset_id id of asset to get history about
         @param period period of history in minutes
         @return list of dicts with entire data of asset for specified period"""
-        timestamp = int((datetime.now() - timedelta(minutes=period)).strftime('%s'))
-        res = await self.db.fetch('''SELECT asset_id as assetId, timestamp as time, value, $1 as assetName 
-                                     FROM asset_history
-                                     WHERE asset_id = $2 AND timestamp > $3''',
-                                  self.current_asset['symbol'], asset_id, timestamp)
-        points = [dict(x) for x in res]
-        return points
+        async with self.request.app['dbpool'].acquire() as conn:
+            timestamp = int((datetime.now() - timedelta(minutes=period)).strftime('%s'))
+            res = await conn.fetch('''SELECT asset_id as assetId, timestamp as time, value, $1 as assetName
+                                      FROM asset_history
+                                      WHERE asset_id = $2 AND timestamp > $3''',
+                                   self.current_asset['symbol'], asset_id, timestamp)
+            points = [dict(x) for x in res]
+            return points
 
     async def get_asset_by_id(self, asset_id):
         """!Trying to find asset by assed_id
         @param asset_id id of asset to search by
         @retrun dict containing id and name of asset"""
-        res = await self.db.fetchrow('SELECT id, symbol FROM assets WHERE id = $1', int(asset_id))
-        if res:
-            return dict(res)
+        async with self.request.app['dbpool'].acquire() as conn:
+            res = await conn.fetchrow('SELECT id, symbol FROM assets WHERE id = $1', int(asset_id))
+            if res:
+                return dict(res)
 
     async def action_assets(self, data):
         """!Loading all assets and sends it into websocket
         @param data request data received from websocket"""
-        res = await self.db.fetch('SELECT id, symbol as name FROM assets')
-        assets = [dict(x) for x in res]
-        await self.send_json(data['action'], message=dict(assets=assets))
+        async with self.request.app['dbpool'].acquire() as conn:
+            res = await conn.fetch('SELECT id, symbol as name FROM assets')
+            assets = [dict(x) for x in res]
+            await self.send_json(data['action'], message=dict(assets=assets))
 
     async def action_subscribe(self, data):
         """!Subscribing to asset redis channel and sending asset history for last 30 minutes
         @param data request data received from websocket"""
         res = await self.get_asset_by_id(data['assetId'])
         if not res:
-            self.send_error(data, 'Asset was not found')
+            await self.send_error(data, 'Asset was not found')
             return
         await self.channel_subscribe(data['assetId'])
         self.current_asset = res
@@ -127,17 +160,24 @@ class WSApp(object):
     async def process_updates(self):
         """!Processing data received from asset redis channel"""
         while  True:
-            if self.subscriber is not None:
-                msg = await self.subscriber.next_published()
-                data = json.loads(msg.value)
-                await self.send_json('point', message=data)
+            try:
+                if self.subscriber is not None:
+                    subscriber = self.subscriber
+                    msg = await asyncio.wait_for(asyncio.shield(subscriber.next_published()), 1.5)
+                    if subscriber.asset_id != self.subscriber.asset_id:
+                        continue
+                    data = json.loads(msg.value)
+                    await self.send_json('point', message=data)
+            except (asyncio.TimeoutError):
+                pass
+            except Exception:
+                traceback.print_exc();
+                break
             await asyncio.sleep(0.1)
 
     async def run(self):
         try:
             await self.ws.prepare(self.request)
-            await self.redis_connect()
-            await self.db_connect()
             while True:
                 task = self.request.app.loop.create_task(self.process_updates())
                 await self.process_actions()
@@ -152,13 +192,19 @@ class WSApp(object):
             return self.ws
         finally:
             task.cancel()
-            if self.redis is not None:
-                self.redis.close()
             try:
                 await self.ws.close()
             except RuntimeError:
                 pass
         return self.ws
+
+
+async def db_connect():
+    return await asyncpg.create_pool(user=os.environ['POSTGRES_DB_USER'],
+                                     password=os.environ['POSTGRES_DB_PASS'],
+                                     database=os.environ['POSTGRES_DB_NAME'],
+                                     host=os.environ['POSTGRES_DB_HOST'],
+                                     port=os.environ['POSTGRES_DB_PORT'])
 
 
 async def ws_handler(request):
@@ -170,7 +216,12 @@ async def on_shutdown(app):
         await ws.close(code=WSCloseCode.GOING_AWAY, message='Server shutdown')
 
 
-application = web.Application()
-application['websockets'] = weakref.WeakSet()
-application.router.add_get('/', ws_handler)
-application.on_shutdown.append(on_shutdown)
+async def get_app():
+    application = web.Application()
+    application['websockets'] = weakref.WeakSet()
+    application['dbpool'] = await db_connect()
+    application['data'] = DataCollector(application['dbpool'])
+    asyncio.create_task(application['data'].run())
+    application.router.add_get('/', ws_handler)
+    application.on_shutdown.append(on_shutdown)
+    return application

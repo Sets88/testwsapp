@@ -8,9 +8,15 @@ import pytest
 import asyncio_redis
 import asyncpg
 
-from testwsapp.ws_app import application
+from testwsapp.ws_app import get_app
 from testwsapp.ws_app import WSApp
+from testwsapp.ws_app import DataCollector
+from testwsapp.ws_app import db_connect as wsdb_connect
 import simplejson as json
+
+
+class Request():
+    pass
 
 
 async def async_magic():
@@ -35,21 +41,6 @@ async def db_connect():
                                      port=os.environ['POSTGRES_DB_PORT'])
 
 
-async def test_redis_connect():
-    wsapp = WSApp(None)
-    await wsapp.redis_connect()
-    await wsapp.redis.set('1', '1')
-    res = await wsapp.redis.get('1')
-    assert res == '1'
-
-
-async def test_db_connect():
-    wsapp = WSApp(None)
-    await wsapp.db_connect()
-    res = await wsapp.db.fetch('SELECT 1;')
-    assert res[0][0] == 1
-
-
 async def test_send_error():
     ws = AMock()
 
@@ -71,8 +62,12 @@ async def test_send_json():
 async def test_channel_subscribe():
     redis_pref = os.environ.get('REDIS_PREFIX', '')
     wsapp = WSApp(None)
+    wsapp.request = Request()
+    db = await wsdb_connect()
+    wsapp.request.app = dict(dbpool=db, data=DataCollector(db))
+    asyncio.create_task(wsapp.request.app['data'].run())
+    await asyncio.sleep(1)
     redis_conn = await redis_connect()
-    await wsapp.redis_connect()
     await wsapp.channel_subscribe(2)
     await redis_conn.publish('%sasset_data_%s' % (redis_pref, 2), "testmsg")
     msg = await asyncio.wait_for(wsapp.subscriber.next_published(), timeout=3)
@@ -87,8 +82,10 @@ async def test_check_input_subsribe():
 
 async def test_get_recent_data_by_asset_id():
     wsapp = WSApp(None)
+    wsapp.request = Request()
+    wsapp.request.app = dict(dbpool=await wsdb_connect())
+
     wsapp.current_asset = dict(symbol='EURUSD')
-    await wsapp.db_connect()
     db = await db_connect()
     res = await wsapp.get_recent_data_by_asset_id(1)
     assert len(res) == 0
@@ -109,8 +106,9 @@ async def test_get_recent_data_by_asset_id():
 
 async def test_get_asset_by_id():
     wsapp = WSApp(None)
+    wsapp.request = Request()
+    wsapp.request.app = dict(dbpool=await wsdb_connect())
     wsapp.current_asset = dict(symbol='EURUSD')
-    await wsapp.db_connect()
     db = await db_connect()
     res = await wsapp.get_asset_by_id(1)
     assert res
@@ -121,8 +119,9 @@ async def test_get_asset_by_id():
 async def test_action_assets():
     send_json = AMock()
     wsapp = WSApp(None)
+    wsapp.request = Request()
+    wsapp.request.app = dict(dbpool=await wsdb_connect())
     wsapp.send_json = send_json
-    await wsapp.db_connect()
     await wsapp.action_assets(dict(action='test'))
     send_json.assert_called_with('test',
                                   message={'assets': [{'id': 1, 'name': 'EURUSD'},
@@ -135,11 +134,12 @@ async def test_action_subscribe():
     send_error = AMock()
     send_json = AMock()
     wsapp = WSApp(None)
+    wsapp.request = Request()
+    wsapp.request.app = dict(dbpool=await wsdb_connect())
     wsapp.send_json = send_json
     wsapp.send_error = send_error
     wsapp.channel_subscribe = AMock()
     db = await db_connect()
-    await wsapp.db_connect()
     await wsapp.action_subscribe(dict(action='subscribe', assetId=10))
     assert send_error.called
     send_error = AMock()
@@ -175,6 +175,8 @@ async def test_process_actions():
             raise StopAsyncIteration
 
     wsapp = WSApp(None)
+    wsapp.request = Request()
+    wsapp.request.app = dict(dbpool=await wsdb_connect())
     wsapp.ws = AsyncWS()
     action_assets = AMock()
     action_subscribe = AMock()
@@ -203,7 +205,7 @@ async def test_intergration(test_client):
                      1, timestamp, 10)
 
 
-    client = await test_client(application)
+    client = await test_client(await get_app())
     async with client.ws_connect('/') as ws:
         await ws.send_json(dict(action='assets'))
         res = await asyncio.wait_for(ws.receive(), timeout=3)
@@ -215,6 +217,7 @@ async def test_intergration(test_client):
                                               {'id': 4, 'name': 'AUDUSD'},
                                               {'id': 5, 'name': 'USDCAD'}]}}
 
+        await asyncio.sleep(0.1)
         # Subscribing to asset 1
         await ws.send_json(dict(action='subscribe', assetId=1))
         res = await asyncio.wait_for(ws.receive(), timeout=1)
@@ -228,10 +231,11 @@ async def test_intergration(test_client):
         assert res['message']['points'][0]['assetname'] == 'EURUSD'
         # Trying to get data shouldn't be
         try:
-            await asyncio.wait_for(ws.receive(), timeout=0.3)
+            res = await asyncio.wait_for(ws.receive(), timeout=0.3)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             res = None
         assert res == None
+        await asyncio.sleep(0.1)
         # Sending data into redis channel
         data = json.dumps(dict(assetName='EURUSD', time=100, assetId=1, value=20))
         await redis_conn.publish('%sasset_data_%s' % (redis_prefix, 1), data)
@@ -240,20 +244,24 @@ async def test_intergration(test_client):
         assert res['message'] == json.loads(data)
         assert res['status'] == 'success'
         assert res['action'] == 'point'
+
+        await asyncio.sleep(0.1)
         # Subscribing to asset 2
         await ws.send_json(dict(action='subscribe', assetId=2))
         res = await asyncio.wait_for(ws.receive(), timeout=1)
         res = json.loads(res.data)
         assert len(res['message']['points']) == 0
 
+        await asyncio.sleep(0.1)
         # Sending data into redis channel for previous asset
         await redis_conn.publish('%sasset_data_%s' % (redis_prefix, 1), data)
         try:
-            await asyncio.wait_for(ws.receive(), timeout=0.3)
+            res = await asyncio.wait_for(ws.receive(), timeout=0.3)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             res = None
         assert res == None
 
+        await asyncio.sleep(0.1)
         # Sending data into correct redis channel
         data = json.dumps(dict(assetName='USDJPY', time=200, assetId=2, value=30))
         await redis_conn.publish('%sasset_data_%s' % (redis_prefix, 2), data)
@@ -263,6 +271,7 @@ async def test_intergration(test_client):
         assert res['status'] == 'success'
         assert res['action'] == 'point'
 
+        await asyncio.sleep(0.1)
         # Sending data into correct redis channel once more time
         data = json.dumps(dict(assetName='USDJPY', time=300, assetId=2, value=40))
         await redis_conn.publish('%sasset_data_%s' % (redis_prefix, 2), data)
