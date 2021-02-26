@@ -8,7 +8,7 @@ setup(
     include_package_data=True,
     python_requires=">=3.6",
     install_requires=[
-        "aiohttp==3.5.4",
+        "aiohttp==3.7.4",
         "asyncpg==0.18.3",
         "asyncio==3.4.3",
         "asyncio_redis==0.15.1",
