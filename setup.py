@@ -9,7 +9,7 @@ setup(
     python_requires=">=3.6",
     install_requires=[
         "aiohttp==3.5.4",
-        "asyncpg==0.18.3",
+        "asyncpg==0.21.0",
         "asyncio==3.4.3",
         "asyncio_redis==0.15.1",
         "simplejson==3.16.0"
